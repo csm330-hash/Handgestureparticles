@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hand Gesture Particles ✨</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a0f; overflow: hidden; font-family: sans-serif; }
+  canvas { position: fixed; top: 0; left: 0; }
+  #video { display: none; }
+  #ui {
+    position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+    background: rgba(255,255,255,0.08); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 20px; padding: 10px 24px;
+    color: rgba(255,255,255,0.85); font-size: 14px; letter-spacing: 0.5px;
+    z-index: 10; text-align: center; pointer-events: none;
+  }
+  #status {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.4); font-size: 12px; z-index: 10;
+    pointer-events: none; letter-spacing: 1px;
+  }
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline></video>
+<canvas id="canvas"></canvas>
+<div id="ui">✋ 손을 펴면 파티클 폭발 &nbsp;|&nbsp; ✊ 주먹 쥐면 에너지볼</div>
+<div id="status">카메라 연결 중...</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const status = document.getElementById('status');
+
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+window.addEventListener('resize', () => {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+});
+
+// ── Particle System ──────────────────────────────────────
+class Particle {
+  constructor(x, y, isEnergyBall) {
+    this.reset(x, y, isEnergyBall);
+  }
+  reset(x, y, isEnergyBall) {
+    this.x = x; this.y = y;
+    this.ox = x; this.oy = y; // origin for energy ball
+    this.isEnergyBall = isEnergyBall;
+    const hue = Math.random() * 360;
+    this.color = `hsl(${hue}, 100%, 65%)`;
+    this.glowColor = `hsl(${hue}, 100%, 80%)`;
+    this.size = Math.random() * 4 + 1.5;
+    this.alpha = 1;
+    if (isEnergyBall) {
+      // orbit motion
+      this.angle = Math.random() * Math.PI * 2;
+      this.radius = Math.random() * 80 + 20;
+      this.speed = (Math.random() * 0.04 + 0.02) * (Math.random() < 0.5 ? 1 : -1);
+      this.vx = 0; this.vy = 0;
+    } else {
+      // explode outward
+      const angle = Math.random() * Math.PI * 2;
+      const speed = Math.random() * 8 + 2;
+      this.vx = Math.cos(angle) * speed;
+      this.vy = Math.sin(angle) * speed;
+      this.gravity = 0.15;
+      this.life = 1;
+      this.decay = Math.random() * 0.015 + 0.008;
+    }
+    return this;
+  }
+  update(cx, cy, mode) {
+    if (mode === 'open') {
+      this.vx *= 0.97;
+      this.vy *= 0.97;
+      this.vy += this.gravity;
+      this.x += this.vx;
+      this.y += this.vy;
+      this.life -= this.decay;
+      this.alpha = Math.max(0, this.life);
+      return this.life > 0;
+    } else {
+      // energy ball: orbit around hand center
+      this.angle += this.speed;
+      const tx = cx + Math.cos(this.angle) * this.radius;
+      const ty = cy + Math.sin(this.angle) * this.radius;
+      this.x += (tx - this.x) * 0.15;
+      this.y += (ty - this.y) * 0.15;
+      this.alpha = 0.85 + Math.sin(Date.now() * 0.005 + this.angle) * 0.15;
+      return true;
+    }
+  }
+  draw() {
+    ctx.save();
+    ctx.globalAlpha = this.alpha;
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = this.glowColor;
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+let particles = [];
+let handCenter = null;
+let currentMode = 'none'; // 'open' | 'fist' | 'none'
+let lastMode = 'none';
+let spawnTimer = 0;
+const MAX_PARTICLES = 300;
+
+function spawnParticles(cx, cy, mode) {
+  if (particles.length > MAX_PARTICLES) return;
+  if (mode === 'open') {
+    for (let i = 0; i < 6; i++) {
+      particles.push(new Particle(cx, cy, false));
+    }
+  } else if (mode === 'fist') {
+    for (let i = 0; i < 4; i++) {
+      particles.push(new Particle(cx, cy, true));
+    }
+  }
+}
+
+// ── Hand Detection ────────────────────────────────────────
+function getFingerExtended(lm, tip, pip) {
+  return lm[tip].y < lm[pip].y;
+}
+
+function detectGesture(landmarks) {
+  const fingers = [
+    getFingerExtended(landmarks, 8, 6),   // index
+    getFingerExtended(landmarks, 12, 10), // middle
+    getFingerExtended(landmarks, 16, 14), // ring
+    getFingerExtended(landmarks, 20, 18), // pinky
+  ];
+  const extended = fingers.filter(Boolean).length;
+  if (extended >= 3) return 'open';
+  if (extended <= 1) return 'fist';
+  return 'neutral';
+}
+
+function getHandCenter(landmarks) {
+  const cx = landmarks.reduce((s, l) => s + l.x, 0) / landmarks.length;
+  const cy = landmarks.reduce((s, l) => s + l.y, 0) / landmarks.length;
+  return {
+    x: (1 - cx) * canvas.width, // mirror
+    y: cy * canvas.height
+  };
+}
+
+// ── Render Loop ───────────────────────────────────────────
+function render() {
+  requestAnimationFrame(render);
+
+  // trail effect
+  ctx.fillStyle = 'rgba(10,10,15,0.25)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const cx = handCenter ? handCenter.x : canvas.width / 2;
+  const cy = handCenter ? handCenter.y : canvas.height / 2;
+
+  if (handCenter) {
+    spawnTimer++;
+    if (spawnTimer % 2 === 0) spawnParticles(cx, cy, currentMode);
+  }
+
+  // update & draw particles
+  particles = particles.filter(p => p.update(cx, cy, p.isEnergyBall ? 'fist' : 'open'));
+  particles.forEach(p => p.draw());
+
+  // energy ball core glow
+  if (currentMode === 'fist' && handCenter) {
+    const t = Date.now() * 0.003;
+    const r = 18 + Math.sin(t) * 5;
+    const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r * 3);
+    grad.addColorStop(0, `rgba(180, 120, 255, 0.7)`);
+    grad.addColorStop(0.4, `rgba(100, 80, 255, 0.3)`);
+    grad.addColorStop(1, `rgba(0,0,0,0)`);
+    ctx.beginPath();
+    ctx.arc(cx, cy, r * 3, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+  }
+}
+render();
+
+// ── MediaPipe Setup ───────────────────────────────────────
+const hands = new Hands({
+  locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+});
+hands.setOptions({
+  maxNumHands: 1,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.5
+});
+
+hands.onResults(results => {
+  if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+    const lm = results.multiHandLandmarks[0];
+    handCenter = getHandCenter(lm);
+    currentMode = detectGesture(lm);
+    status.textContent = currentMode === 'open' ? '✋ 손 열림 — 파티클 폭발!' : currentMode === 'fist' ? '✊ 주먹 — 에너지볼!' : '🖐 인식 중...';
+  } else {
+    handCenter = null;
+    currentMode = 'none';
+    status.textContent = '손을 카메라에 보여주세요';
+  }
+});
+
+// ── Camera ───────────────────────────────────────────────
+const camera = new Camera(video, {
+  onFrame: async () => { await hands.send({ image: video }); },
+  width: 640, height: 480
+});
+camera.start().then(() => {
+  status.textContent = '손을 카메라에 보여주세요';
+}).catch(() => {
+  status.textContent = '카메라 접근 권한이 필요해요';
+});
+</script>
+</body>
+</html>
